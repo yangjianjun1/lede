@@ -1,0 +1,254 @@
+#============================================================================================
+# Build OpenWrt for 玩客云 thunder-onecloud | rootfs独立编译 + 外挂内核打包
+#============================================================================================
+
+name: Build OpenWrt for OneCloud
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "源码分支"
+        required: false
+        default: "openwrt_main"
+        type: choice
+        options:
+          - openwrt_main
+          - lede_master
+          - immortalwrt_master
+      openwrt_board:
+        description: "设备机型（固定玩客云）"
+        required: false
+        default: "thunder-onecloud"
+        type: choice
+        options:
+          - thunder-onecloud
+      openwrt_kernel:
+        description: "内核版本"
+        required: false
+        default: "6.12.y_6.18.y"
+        type: choice
+        options:
+          - 6.12.y
+          - 6.18.y
+          - 6.12.y_6.18.y
+      auto_kernel:
+        description: 自动拉取最新内核
+        required: false
+        default: true
+        type: boolean
+      kernel_repo:
+        required: false
+        default: "ophub/kernel"
+      kernel_usage:
+        required: false
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - flippy
+      openwrt_ip:
+        description: 默认网关IP
+        required: false
+        default: "192.168.1.1"
+      use_ccache:
+        required: false
+        default: true
+        type: boolean
+      openwrt_storage:
+        required: false
+        default: "save"
+        type: choice
+        options:
+          - save
+          - temp
+      builder_name:
+        required: false
+        default: "ophub"
+
+env:
+  TZ: Asia/Shanghai
+  CCACHE_DIR: /builder/openwrt/.ccache
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: 生成矩阵
+        id: set-matrix
+        run: |
+          MATRIX='{"include":[{"branch":"${{ inputs.source_branch }}"}]}'
+          echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: setup
+    runs-on: ubuntu-24.04
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+
+    name: build-${{ matrix.branch }}
+
+    env:
+      FEEDS_CONF: config/${{ matrix.branch }}/feeds.conf.default
+      CONFIG_FILE: config/${{ matrix.branch }}/config
+      DIY_P1_SH: config/${{ matrix.branch }}/diy-part1.sh
+      DIY_P2_SH: config/${{ matrix.branch }}/diy-part2.sh
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 初始化编译环境
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          sudo swapoff -a
+          sudo rm -f /swapfile
+          sudo apt-get -y update
+          sudo apt-get -y purge ghc* llvm* firefox dotnet* openjdk* moby* || true
+          sudo apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-make-openwrt-depends)
+          sudo apt-get -y autoremove --purge
+          sudo apt-get clean
+          sudo timedatectl set-timezone Asia/Shanghai
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 创建大容量虚拟磁盘
+        id: disk
+        run: |
+          root_avail=$(df --block-size=1G / | awk 'NR==2{print $4}')
+          root_size=$(( root_avail > 5 ? root_avail - 4 : 0 ))
+          if [[ ${root_size} -lt 10 ]]; then echo "NO_SPACE"; exit 1; fi
+          sudo truncate -s "${root_size}"G /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          sudo mkfs.xfs -f "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 克隆OpenWrt源码
+        id: codes
+        working-directory: /builder
+        run: |
+          branch_input="${{ matrix.branch }}"
+          if [[ "${branch_input}" == "openwrt_main" ]]; then
+            REPO_URL="https://github.com/openwrt/openwrt"
+            REPO_BRANCH="main"
+          elif [[ "${branch_input}" == "lede_master" ]]; then
+            REPO_URL="https://github.com/coolsnowwolf/lede"
+            REPO_BRANCH="master"
+          elif [[ "${branch_input}" == "immortalwrt_master" ]]; then
+            REPO_URL="https://github.com/immortalwrt/immortalwrt"
+            REPO_BRANCH="master"
+          fi
+
+          git clone --single-branch --depth 1 -b ${REPO_BRANCH} ${REPO_URL} openwrt
+          ln -sf /builder/openwrt ${{ github.workspace }}/openwrt
+
+          echo "build_tag=OpenWrt_${{ matrix.branch }}_OneCloud_$(date +"%Y.%m")" >> ${GITHUB_ENV}
+          echo "REPO_URL=${REPO_URL}" >> ${GITHUB_ENV}
+          echo "REPO_BRANCH=${REPO_BRANCH}" >> ${GITHUB_ENV}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # 缓存源码包与编译缓存，大幅提速
+      - name: 缓存dl下载目录
+        uses: actions/cache@v5
+        with:
+          path: /builder/openwrt/dl
+          key: dl-${{ matrix.branch }}-${{ github.sha }}
+          restore-keys: dl-${{ matrix.branch }}-
+
+      - name: 缓存ccache工具链
+        uses: actions/cache@v5
+        with:
+          path: /builder/openwrt/.ccache
+          key: ccache-${{ matrix.branch }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.branch }}-
+
+      - name: 执行diy-part1.sh
+        run: |
+          [[ -f "${FEEDS_CONF}" ]] && cp ${FEEDS_CONF} openwrt/feeds.conf.default
+          chmod +x ${DIY_P1_SH}
+          cd openwrt && ${{ github.workspace }}/${DIY_P1_SH}
+
+      - name: 更新并安装插件源
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 加载配置 + 执行diy-part2.sh
+        run: |
+          [[ -d files ]] && mv files openwrt/
+          [[ -f "${CONFIG_FILE}" ]] && cp ${CONFIG_FILE} openwrt/.config
+          chmod +x ${DIY_P2_SH}
+          cd openwrt
+          ${{ github.workspace }}/${DIY_P2_SH} "${{ inputs.openwrt_ip }}" "${{ inputs.use_ccache }}"
+
+      - name: 预下载全部源码包
+        run: |
+          cd openwrt
+          make defconfig
+          make download -j8
+          find dl -size -1024c -delete
+
+      - name: 编译arm64通用rootfs
+        id: compile
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+          ccache -s
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 整理rootfs文件
+        run: |
+          cd openwrt
+          mkdir -p output
+          cp bin/targets/*/*/*rootfs.tar.gz output/
+          cp .config output/
+
+      - name: 上传rootfs到Release
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: ${{ env.build_tag }}
+          artifacts: openwrt/output/*
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 仅打包玩客云 thunder-onecloud，不会生成其他机顶盒固件
+      - name: 组合内核+rootfs生成玩客云镜像
+        uses: ophub/amlogic-s9xxx-openwrt@main
+        with:
+          openwrt_path: openwrt/output/*rootfs.tar.gz
+          openwrt_ip: ${{ inputs.openwrt_ip }}
+          openwrt_board: ${{ inputs.openwrt_board }}
+          openwrt_kernel: ${{ inputs.openwrt_kernel }}
+          auto_kernel: ${{ inputs.auto_kernel }}
+          kernel_repo: ${{ inputs.kernel_repo }}
+          kernel_usage: ${{ inputs.kernel_usage }}
+          builder_name: ${{ inputs.builder_name }}
+
+      - name: 上传玩客云固件镜像
+        uses: ophub/upload-to-releases@main
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        with:
+          tag: ${{ env.build_tag }}
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            设备：玩客云 OneCloud (thunder-onecloud)
+            默认IP：192.168.1.1
+            账号：root
+            密码：password
+            内核版本：${{ inputs.openwrt_kernel }}
